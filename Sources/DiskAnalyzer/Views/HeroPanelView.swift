@@ -48,8 +48,9 @@ struct HeroPanelView: View {
 
     @ViewBuilder
     private var volumeBlock: some View {
-        if let total = volumeTotal, total > 0 {
-            let usedFraction = min(1, max(0, Double(root.size) / Double(total)))
+        if let total = volumeTotal, total > 0, let free = volumeFree {
+            let used = max(0, total - free)
+            let usedFraction = min(1, max(0, Double(used) / Double(total)))
             VStack(alignment: .trailing, spacing: 8) {
                 HStack(spacing: 6) {
                     Text("\(Int(round(usedFraction * 100)))%")
@@ -62,7 +63,8 @@ struct HeroPanelView: View {
                         .lineLimit(1)
                 }
 
-                // Thin volume meter — scanned-size as a share of the disk.
+                // Thin volume meter — volume used (total − free) as a share of
+                // the disk. Matches what "About This Mac" / Finder report.
                 // Width flexes with the block; no fixed 260pt so it can't overflow.
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
@@ -74,12 +76,12 @@ struct HeroPanelView: View {
                 }
                 .frame(maxWidth: 260, minHeight: 3, maxHeight: 3)
 
-                if let free = volumeFree {
-                    Text("\(SizeFormatter.string(free)) free")
-                        .font(DT.mono(10))
-                        .foregroundStyle(DT.fgSubtle)
-                        .monospacedDigit()
-                }
+                Text("Scanned \(SizeFormatter.string(root.size)) of \(SizeFormatter.string(used)) used · \(SizeFormatter.string(free)) free")
+                    .font(DT.mono(10))
+                    .foregroundStyle(DT.fgSubtle)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         } else {
             EmptyView()
