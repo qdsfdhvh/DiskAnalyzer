@@ -126,45 +126,55 @@ struct ContentView: View {
 
     // MARK: Toolbar
 
+    /// The custom toolbar. Deliberately does NOT repeat the app name — the
+    /// native window title bar already shows "Disk Analyzer". We only surface
+    /// the current path (or an empty-state hint) + action buttons.
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Text("Disk Analyzer")
-                .font(DT.text(13, weight: .semibold))
-                .foregroundStyle(DT.fg)
-
-            if let url = viewModel.selectedURL {
-                Text("·")
-                    .foregroundStyle(DT.fgSubtle)
-                Text(url.path)
-                    .font(DT.mono(11))
-                    .foregroundStyle(DT.fgMuted)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            Spacer()
-
-            if viewModel.isScanning {
-                Button("Cancel") { viewModel.cancel() }
-                    .buttonStyle(QuietButtonStyle(variant: .secondary))
-            } else {
-                if viewModel.selectedURL != nil {
-                    Button("Rescan") {
-                        if let url = viewModel.selectedURL { viewModel.scan(url: url) }
-                    }
-                    .buttonStyle(QuietButtonStyle(variant: .ghost))
-                    .keyboardShortcut("r", modifiers: .command)
+            // Left: path or hint. Flexes + truncates so the buttons always fit.
+            Group {
+                if let url = viewModel.selectedURL {
+                    Text(url.path)
+                        .font(DT.mono(11))
+                        .foregroundStyle(DT.fgMuted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Text("No folder scanned yet")
+                        .font(DT.text(12))
+                        .foregroundStyle(DT.fgSubtle)
                 }
-                Button("Choose Folder") { viewModel.pickAndScan() }
-                    .buttonStyle(QuietButtonStyle(variant: .secondary))
-                    .keyboardShortcut("o", modifiers: .command)
-                Button("Scan Home") { viewModel.scanHome() }
-                    .buttonStyle(QuietButtonStyle(variant: .primary))
-                    .keyboardShortcut("h", modifiers: .command)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(0)
+
+            // Right: action buttons. fixedSize + layoutPriority(1) guarantees
+            // they always render at natural width, regardless of window size.
+            HStack(spacing: 8) {
+                if viewModel.isScanning {
+                    Button("Cancel") { viewModel.cancel() }
+                        .buttonStyle(QuietButtonStyle(variant: .secondary))
+                } else {
+                    if viewModel.selectedURL != nil {
+                        Button("Rescan") {
+                            if let url = viewModel.selectedURL { viewModel.scan(url: url) }
+                        }
+                        .buttonStyle(QuietButtonStyle(variant: .ghost))
+                        .keyboardShortcut("r", modifiers: .command)
+                    }
+                    Button("Choose Folder") { viewModel.pickAndScan() }
+                        .buttonStyle(QuietButtonStyle(variant: .secondary))
+                        .keyboardShortcut("o", modifiers: .command)
+                    Button("Scan Home") { viewModel.scanHome() }
+                        .buttonStyle(QuietButtonStyle(variant: .primary))
+                        .keyboardShortcut("h", modifiers: .command)
+                }
+            }
+            .fixedSize()
+            .layoutPriority(1)
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 12)
+        .padding(.vertical, 10)
         .background(DT.bg)
     }
 
