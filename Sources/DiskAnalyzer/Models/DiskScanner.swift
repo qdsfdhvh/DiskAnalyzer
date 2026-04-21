@@ -7,29 +7,86 @@ struct ScanProgress: Sendable {
     var skippedMounts: Int = 0
 }
 
+/// Gates concurrent directory I/O. Without this, async recursion at every
+/// level would fan out to thousands of simultaneous readdir/stat syscalls,
+/// which is actually slower than keeping roughly CPU-core-count worth of
+/// them in flight at any moment.
+actor ScanLimiter {
+    let limit: Int
+    private var active = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { self.limit = max(1, limit) }
+
+    func acquire() async {
+        if active < limit {
+            active += 1
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if let waiter = waiters.first {
+            waiters.removeFirst()
+            waiter.resume()
+        } else {
+            active = max(0, active - 1)
+        }
+    }
+}
+
 final class DiskScanner: @unchecked Sendable {
 
     private let counter = Counter()
     private var cancelled = false
     /// Identifier of the volume the scan started on. Anything on a different
-    /// volume (external drives, SMB/NFS/AFP mounts, Time Machine snapshots,
-    /// Photos/Aperture libraries that live elsewhere) is skipped so the numbers
-    /// reflect what's actually taking space on the boot disk.
-    /// Compared via `isEqual(_:)` — the underlying type is NSObject-derived.
+    /// volume (external drives, SMB/NFS/AFP mounts, Time Machine snapshots)
+    /// is skipped so numbers reflect only the boot disk.
     private var rootVolumeID: (any NSObjectProtocol)?
 
+    /// Keys pre-fetched by `contentsOfDirectory(at:includingPropertiesForKeys:)`
+    /// so per-child `resourceValues` calls hit the cache instead of doing a
+    /// fresh stat().
+    ///
+    /// `.isPackageKey` is deliberately absent — asking for it triggers a
+    /// LaunchServices UTI lookup per URL, which on a million-file scan costs
+    /// real wall-clock seconds. Package-ness is determined below by an
+    /// extension whitelist, which is how ~all macOS packages declare
+    /// themselves anyway.
     private static let resourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey,
         .isSymbolicLinkKey,
         .totalFileAllocatedSizeKey,
         .fileSizeKey,
-        .isPackageKey,
         .volumeIdentifierKey
     ]
 
-    /// Minimum child count at which it's worth paying Task/TaskGroup overhead
-    /// to parallelize a directory's children. Below this, serial is faster.
-    private static let parallelThreshold = 8
+    /// Directory extensions treated as opaque packages: we report their total
+    /// size but don't expose their contents in the tree. Curated list of
+    /// common Apple bundle types + a few third-party formats; matching on
+    /// extension is orders of magnitude cheaper than `.isPackageKey`.
+    private static let packageExtensions: Set<String> = [
+        "app", "bundle", "framework", "plugin", "kext", "docset",
+        "photoslibrary", "musiclibrary", "tvlibrary", "aplibrary",
+        "imovielibrary", "theater",
+        "rtfd", "pages", "numbers", "key",
+        "dsym", "xcarchive", "xcodeproj", "xcworkspace", "playground",
+        "pkg", "mpkg",
+        "scptd", "wdgt", "qlgenerator", "mdimporter", "component",
+        "lbaction", "prefpane"
+    ]
+
+    private static func isPackage(_ url: URL) -> Bool {
+        packageExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// Limit simultaneous readdir calls to ~CPU core count. The multiplier
+    /// above activeProcessorCount is intentional — I/O-bound tasks benefit
+    /// from a little over-subscription.
+    private let limiter = ScanLimiter(
+        limit: max(4, ProcessInfo.processInfo.activeProcessorCount)
+    )
 
     func cancel() {
         cancelled = true
@@ -44,7 +101,6 @@ final class DiskScanner: @unchecked Sendable {
         rootVolumeID = (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))
             .flatMap { $0.volumeIdentifier }
 
-        // Periodic progress reporter on a background task.
         let reporter = Task.detached(priority: .utility) { [counter] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -53,13 +109,63 @@ final class DiskScanner: @unchecked Sendable {
         }
         defer {
             reporter.cancel()
-            // Final report
             onProgress(counter.snapshot())
         }
 
-        let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
-        let root = FileNode(url: url, name: name, isDirectory: true)
+        return await scanAsync(url: url) ?? emptyDirNode(for: url)
+    }
 
+    private func emptyDirNode(for url: URL) -> FileNode {
+        let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+        return FileNode(url: url, name: name, isDirectory: true)
+    }
+
+    /// Recursive async scan. Files are handled inline (no Task overhead);
+    /// subdirectories fan out via TaskGroup. The scanner's limiter caps
+    /// concurrent readdir calls so the fan-out stays bounded no matter how
+    /// deep the tree goes.
+    private func scanAsync(url: URL) async -> FileNode? {
+        if cancelled { return nil }
+
+        guard let values = try? url.resourceValues(forKeys: Self.resourceKeys) else {
+            return nil
+        }
+
+        if values.isSymbolicLink ?? false { return nil }
+
+        if let rootVol = rootVolumeID,
+           let vol = values.volumeIdentifier,
+           !vol.isEqual(rootVol) {
+            counter.noteSkippedMount()
+            return nil
+        }
+
+        let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+
+        if !(values.isDirectory ?? false) {
+            let size = Int64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
+            return FileNode(url: url, name: name, isDirectory: false, size: size)
+        }
+
+        let dirNode = FileNode(url: url, name: name, isDirectory: true)
+
+        // Packages: flat-walk with an enumerator to sum size. Avoids the
+        // async fan-out entirely, which matters because packages often hold
+        // thousands of tiny files we don't want to expose in the UI anyway.
+        if Self.isPackage(url) {
+            let (size, fileCount) = Self.packageTotal(at: url)
+            dirNode.size = size
+            dirNode.children = nil
+            if fileCount > 0 {
+                counter.addBatch(bytes: size, files: fileCount, currentPath: url.path)
+            }
+            return dirNode
+        }
+
+        // Read this directory under the concurrency gate, release the slot
+        // BEFORE awaiting children. Holding it while recursing would serialize
+        // the whole tree and defeat the purpose of the pool.
+        await limiter.acquire()
         let contents: [URL]
         do {
             contents = try FileManager.default.contentsOfDirectory(
@@ -68,174 +174,49 @@ final class DiskScanner: @unchecked Sendable {
                 options: []
             )
         } catch {
-            return root
-        }
-
-        let scanner = self
-        let children: [FileNode] = await withTaskGroup(of: FileNode?.self) { group in
-            for child in contents {
-                group.addTask { [scanner] in
-                    if scanner.cancelled { return nil }
-                    // Top-level TaskGroup already gives 1 layer of parallelism;
-                    // allow up to 2 more layers inside scanParallel before
-                    // falling through to the synchronous scanRecursively.
-                    return await scanner.scanParallel(url: child, parallelDepth: 2)
-                }
-            }
-            var results: [FileNode] = []
-            for await node in group {
-                if let node { results.append(node) }
-            }
-            return results
-        }
-
-        var total: Int64 = 0
-        var leafBytes: Int64 = 0
-        var leafFiles = 0
-        for c in children {
-            c.parent = root
-            total += c.size
-            if !c.isDirectory {
-                leafBytes += c.size
-                leafFiles += 1
-            }
-        }
-        if leafFiles > 0 {
-            counter.addBatch(bytes: leafBytes, files: leafFiles, currentPath: url.path)
-        }
-        root.children = children.sorted { $0.size > $1.size }
-        root.size = total
-        return root
-    }
-
-    /// Recursive, synchronous scan run on a background thread.
-    private func scanRecursively(url: URL) -> FileNode? {
-        if cancelled { return nil }
-
-        let values = try? url.resourceValues(forKeys: Self.resourceKeys)
-
-        // Skip symlinks to avoid cycles and double-counting.
-        if values?.isSymbolicLink ?? false { return nil }
-
-        // Skip anything on a different volume (NAS, external drives, etc.).
-        // Network mounts under ~/Library/Containers/.../ServerConn/smb are a
-        // common offender: they look like local paths but live on SMB.
-        if let root = rootVolumeID,
-           let vol = values?.volumeIdentifier,
-           !vol.isEqual(root) {
-            counter.noteSkippedMount()
-            return nil
-        }
-
-        let isDir = values?.isDirectory ?? false
-        let name = url.lastPathComponent
-
-        if !isDir {
-            let size = Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
-            // Counter update is batched into the parent directory's flush.
-            return FileNode(url: url, name: name, isDirectory: false, size: size)
-        }
-
-        // Treat app bundles (.app, .photoslibrary, etc.) as opaque for a cleaner tree,
-        // but still sum their contents so size is accurate.
-        let isPackage = values?.isPackage ?? false
-
-        let dirNode = FileNode(url: url, name: name, isDirectory: true)
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: Array(Self.resourceKeys),
-            options: []
-        ) else {
-            // Permission denied or unreadable directory.
+            await limiter.release()
             return dirNode
         }
+        await limiter.release()
 
-        var childNodes: [FileNode] = []
-        var total: Int64 = 0
+        // Partition children: files are built inline (cheap), subdirectories
+        // are collected for async fan-out.
+        var inlineFiles: [FileNode] = []
+        var subdirURLs: [URL] = []
         var leafBytes: Int64 = 0
-        var leafFiles = 0
 
         for child in contents {
             if cancelled { break }
-            if let sub = scanRecursively(url: child) {
-                sub.parent = dirNode
-                total += sub.size
-                childNodes.append(sub)
-                if !sub.isDirectory {
-                    leafBytes += sub.size
-                    leafFiles += 1
-                }
+            guard let cv = try? child.resourceValues(forKeys: Self.resourceKeys) else {
+                continue
+            }
+            if cv.isSymbolicLink ?? false { continue }
+            if let rootVol = rootVolumeID,
+               let vol = cv.volumeIdentifier,
+               !vol.isEqual(rootVol) {
+                counter.noteSkippedMount()
+                continue
+            }
+
+            let childName = child.lastPathComponent
+            if cv.isDirectory ?? false {
+                subdirURLs.append(child)
+            } else {
+                let size = Int64(cv.totalFileAllocatedSize ?? cv.fileSize ?? 0)
+                inlineFiles.append(FileNode(
+                    url: child, name: childName, isDirectory: false, size: size
+                ))
+                leafBytes += size
             }
         }
 
-        if leafFiles > 0 {
-            counter.addBatch(bytes: leafBytes, files: leafFiles, currentPath: url.path)
-        }
-
-        dirNode.size = total
-        // Packages are leaves in the UI but still report correct total.
-        dirNode.children = isPackage ? nil : childNodes.sorted { $0.size > $1.size }
-        return dirNode
-    }
-
-    /// Async variant of `scanRecursively` that keeps a small parallelism
-    /// budget. At each directory level, if the budget is non-zero and the
-    /// directory has enough children to justify Task overhead, it fans out
-    /// via a TaskGroup. Otherwise it falls through to the fully synchronous
-    /// `scanRecursively` path. This keeps the hot deep-recursion path free
-    /// of async machinery, which measured slower when applied uniformly.
-    private func scanParallel(url: URL, parallelDepth: Int) async -> FileNode? {
-        if cancelled { return nil }
-
-        let values = try? url.resourceValues(forKeys: Self.resourceKeys)
-
-        if values?.isSymbolicLink ?? false { return nil }
-
-        if let root = rootVolumeID,
-           let vol = values?.volumeIdentifier,
-           !vol.isEqual(root) {
-            counter.noteSkippedMount()
-            return nil
-        }
-
-        let isDir = values?.isDirectory ?? false
-        let name = url.lastPathComponent
-
-        if !isDir {
-            let size = Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
-            return FileNode(url: url, name: name, isDirectory: false, size: size)
-        }
-
-        let isPackage = values?.isPackage ?? false
-        let dirNode = FileNode(url: url, name: name, isDirectory: true)
-
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: Array(Self.resourceKeys),
-            options: []
-        ) else {
-            return dirNode
-        }
-
-        var childNodes: [FileNode] = []
-        var total: Int64 = 0
-        var leafBytes: Int64 = 0
-        var leafFiles = 0
-
-        if parallelDepth > 0 && contents.count >= Self.parallelThreshold {
-            let scanner = self
-            let nextDepth = parallelDepth - 1
-            let subs: [FileNode] = await withTaskGroup(of: FileNode?.self) { group in
-                for child in contents {
-                    group.addTask { [scanner] in
-                        if scanner.cancelled { return nil }
-                        if nextDepth > 0 {
-                            return await scanner.scanParallel(url: child, parallelDepth: nextDepth)
-                        } else {
-                            return scanner.scanRecursively(url: child)
-                        }
-                    }
+        // One Task per subdirectory (never per file). For a ~6M-file home
+        // scan with ~50K directories, that's ~50K Tasks — manageable.
+        var subdirNodes: [FileNode] = []
+        if !subdirURLs.isEmpty {
+            subdirNodes = await withTaskGroup(of: FileNode?.self) { group in
+                for sub in subdirURLs {
+                    group.addTask { [self] in await scanAsync(url: sub) }
                 }
                 var results: [FileNode] = []
                 for await node in group {
@@ -243,37 +224,53 @@ final class DiskScanner: @unchecked Sendable {
                 }
                 return results
             }
-            for sub in subs {
-                sub.parent = dirNode
-                total += sub.size
-                childNodes.append(sub)
-                if !sub.isDirectory {
-                    leafBytes += sub.size
-                    leafFiles += 1
-                }
-            }
-        } else {
-            for child in contents {
-                if cancelled { break }
-                if let sub = scanRecursively(url: child) {
-                    sub.parent = dirNode
-                    total += sub.size
-                    childNodes.append(sub)
-                    if !sub.isDirectory {
-                        leafBytes += sub.size
-                        leafFiles += 1
-                    }
-                }
-            }
         }
 
-        if leafFiles > 0 {
-            counter.addBatch(bytes: leafBytes, files: leafFiles, currentPath: url.path)
+        // One counter flush per directory, regardless of file count.
+        if !inlineFiles.isEmpty {
+            counter.addBatch(
+                bytes: leafBytes,
+                files: inlineFiles.count,
+                currentPath: url.path
+            )
+        }
+
+        let allChildren = inlineFiles + subdirNodes
+        var total: Int64 = 0
+        for c in allChildren {
+            c.parent = dirNode
+            total += c.size
         }
 
         dirNode.size = total
-        dirNode.children = isPackage ? nil : childNodes.sorted { $0.size > $1.size }
+        dirNode.children = allChildren.sorted { $0.size > $1.size }
         return dirNode
+    }
+
+    /// Flat walk over a package's contents to sum its total size. We use the
+    /// FileManager enumerator here rather than recursing because we throw
+    /// away the tree — only the aggregate number matters for a package leaf.
+    private static func packageTotal(at url: URL) -> (bytes: Int64, fileCount: Int) {
+        var total: Int64 = 0
+        var count = 0
+        let keys: [URLResourceKey] = [
+            .totalFileAllocatedSizeKey, .fileSizeKey,
+            .isDirectoryKey, .isSymbolicLinkKey
+        ]
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: keys,
+            options: []
+        ) else { return (0, 0) }
+
+        for case let child as URL in enumerator {
+            guard let v = try? child.resourceValues(forKeys: Set(keys)) else { continue }
+            if v.isSymbolicLink ?? false { continue }
+            if v.isDirectory ?? false { continue }
+            total += Int64(v.totalFileAllocatedSize ?? v.fileSize ?? 0)
+            count += 1
+        }
+        return (total, count)
     }
 
     // MARK: - Thread-safe counter
@@ -286,9 +283,8 @@ final class DiskScanner: @unchecked Sendable {
         private var skipped: Int = 0
 
         /// Bulk-apply the leaf-file totals accumulated while scanning one
-        /// directory. Keeping this per-directory (instead of per-file) keeps
-        /// lock traffic proportional to directory count, not file count —
-        /// a big win on trees with hundreds of thousands of files.
+        /// directory. Keeping this per-directory (not per-file) keeps lock
+        /// traffic proportional to directory count, not file count.
         func addBatch(bytes extra: Int64, files extraFiles: Int, currentPath: String) {
             lock.lock()
             bytes += extra
