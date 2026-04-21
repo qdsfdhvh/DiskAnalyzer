@@ -59,10 +59,17 @@ final class ScanViewModel: ObservableObject {
         scanTask = Task { @MainActor [weak self] in
             let result = await scanner.scan(at: url) { progress in
                 Task { @MainActor in
+                    // Late progress callbacks from a cancelled scan must not
+                    // overwrite the state of the scan that replaced it.
+                    guard !Task.isCancelled else { return }
                     self?.progress = progress
                 }
             }
-            guard let self else { return }
+            // If cancel() fired while we were awaiting — or if the user
+            // kicked off a fresh scan — Task.isCancelled on THIS task is
+            // true, and our `result` is a partial/empty tree. Dropping it
+            // here is what makes Cancel actually cancel from the user's POV.
+            guard let self, !Task.isCancelled else { return }
             self.root = result
             self.isScanning = false
             self.timerTask?.cancel()
