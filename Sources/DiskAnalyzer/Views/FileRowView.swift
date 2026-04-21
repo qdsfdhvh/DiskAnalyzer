@@ -1,50 +1,66 @@
 import SwiftUI
 import AppKit
 
+/// Quiet row: name left, tabular size right, a short subtle bar between them
+/// showing share of parent. Tier color tints the bar, so real outliers pick
+/// up the terracotta accent while most rows stay neutral gray.
 struct FileRowView: View {
     let node: FileNode
     let parentSize: Int64
-    let rootSize: Int64
+    let rank: Int   // 0 = largest in parent
 
     @State private var isHovering = false
 
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(nsImage: icon)
-                .resizable()
-                .frame(width: 18, height: 18)
+    private var fraction: Double {
+        guard parentSize > 0 else { return 0 }
+        return min(1, Double(node.size) / Double(parentSize))
+    }
 
+    private var tierColor: Color {
+        // The #1 row in each parent is always the accent, regardless of size.
+        // That gives every folder one clear focal point.
+        if rank == 0 && node.size >= 10 * 1024 * 1024 { return DT.accent }
+        return DT.tier(forBytes: node.size)
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 16) {
             Text(node.name)
+                .font(DT.text(13, weight: rank == 0 ? .medium : .regular))
+                .foregroundStyle(DT.fg)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .frame(maxWidth: 280, alignment: .leading)
 
-            Spacer(minLength: 8)
-
-            // Percentage of parent as a subtle bar.
+            // Proportional bar. 3pt tall, rounded, tinted by tier.
             GeometryReader { geo in
-                let pct = parentSize > 0 ? Double(node.size) / Double(parentSize) : 0
                 ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.secondary.opacity(0.12))
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(barColor(pct: pct))
-                        .frame(width: max(2, geo.size.width * pct))
+                    Capsule().fill(DT.line)
+                    Capsule()
+                        .fill(tierColor)
+                        .frame(width: max(2, geo.size.width * fraction))
                 }
             }
-            .frame(width: 120, height: 8)
+            .frame(height: 3)
 
-            Text(SizeFormatter.percent(node.size, of: parentSize))
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .trailing)
+            Text(percentLabel)
+                .font(DT.mono(11))
+                .foregroundStyle(DT.fgMuted)
+                .monospacedDigit()
+                .frame(width: 48, alignment: .trailing)
 
             Text(SizeFormatter.string(node.size))
-                .font(.system(.body, design: .monospaced))
-                .frame(width: 90, alignment: .trailing)
+                .font(DT.mono(12, weight: rank == 0 ? .semibold : .regular))
+                .foregroundStyle(DT.fg)
+                .monospacedDigit()
+                .frame(width: 92, alignment: .trailing)
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, DT.rowVPadding)
+        .background(isHovering ? DT.hover : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
-        .background(isHovering ? Color.accentColor.opacity(0.06) : Color.clear)
         .contextMenu {
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([node.url])
@@ -61,16 +77,11 @@ struct FileRowView: View {
         }
     }
 
-    private var icon: NSImage {
-        NSWorkspace.shared.icon(forFile: node.url.path)
-    }
-
-    private func barColor(pct: Double) -> Color {
-        switch pct {
-        case 0.5...: return .red
-        case 0.25..<0.5: return .orange
-        case 0.1..<0.25: return .yellow
-        default: return .accentColor
-        }
+    private var percentLabel: String {
+        guard parentSize > 0 else { return "—" }
+        let v = Double(node.size) / Double(parentSize) * 100
+        if v >= 10 { return String(format: "%.0f%%", v) }
+        if v >= 1  { return String(format: "%.1f%%", v) }
+        return String(format: "%.2f%%", v)
     }
 }

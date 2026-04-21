@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 
+// MARK: - View model
+
 @MainActor
 final class ScanViewModel: ObservableObject {
     @Published var root: FileNode?
@@ -8,6 +10,8 @@ final class ScanViewModel: ObservableObject {
     @Published var isScanning = false
     @Published var progress = ScanProgress()
     @Published var elapsed: TimeInterval = 0
+    @Published var volumeTotal: Int64?
+    @Published var volumeFree: Int64?
 
     private var scanner: DiskScanner?
     private var scanTask: Task<Void, Never>?
@@ -39,6 +43,7 @@ final class ScanViewModel: ObservableObject {
         progress = ScanProgress()
         elapsed = 0
         isScanning = true
+        (volumeTotal, volumeFree) = Self.volumeCapacity(for: url)
 
         let scanner = DiskScanner()
         self.scanner = scanner
@@ -74,169 +79,318 @@ final class ScanViewModel: ObservableObject {
         timerTask = nil
         isScanning = false
     }
+
+    private static func volumeCapacity(for url: URL) -> (Int64?, Int64?) {
+        guard let values = try? url.resourceValues(forKeys: [
+            .volumeTotalCapacityKey,
+            .volumeAvailableCapacityForImportantUsageKey
+        ]) else { return (nil, nil) }
+        let total = values.volumeTotalCapacity.map { Int64($0) }
+        let free = values.volumeAvailableCapacityForImportantUsage
+        return (total, free)
+    }
 }
+
+// MARK: - Root
 
 struct ContentView: View {
     @StateObject private var viewModel = ScanViewModel()
 
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            content
-            Divider()
-            statusBar
+        ZStack {
+            DT.bg.ignoresSafeArea()
+            VStack(spacing: 0) {
+                toolbar
+                Rectangle().fill(DT.line).frame(height: 1)
+
+                if let root = viewModel.root {
+                    HeroPanelView(
+                        root: root,
+                        volumeTotal: viewModel.volumeTotal,
+                        volumeFree: viewModel.volumeFree
+                    )
+                    Rectangle().fill(DT.line).frame(height: 1)
+                    listBody(root: root)
+                } else if viewModel.isScanning {
+                    scanningState
+                } else {
+                    emptyState
+                }
+
+                statusBar
+            }
         }
-        .frame(minWidth: 820, minHeight: 520)
+        .frame(minWidth: 880, minHeight: 600)
+        .preferredColorScheme(.light)
     }
 
+    // MARK: Toolbar
+
     private var toolbar: some View {
-        HStack(spacing: 8) {
-            Button {
-                viewModel.pickAndScan()
-            } label: {
-                Label("Choose Folder…", systemImage: "folder")
-            }
+        HStack(spacing: 12) {
+            Text("Disk Analyzer")
+                .font(DT.text(13, weight: .semibold))
+                .foregroundStyle(DT.fg)
 
-            Button {
-                viewModel.scanHome()
-            } label: {
-                Label("Scan Home", systemImage: "house")
-            }
-
-            if let url = viewModel.selectedURL, !viewModel.isScanning {
-                Button {
-                    viewModel.scan(url: url)
-                } label: {
-                    Label("Rescan", systemImage: "arrow.clockwise")
-                }
-            }
-
-            if viewModel.isScanning {
-                Button(role: .destructive) {
-                    viewModel.cancel()
-                } label: {
-                    Label("Cancel", systemImage: "stop.circle")
-                }
-                ProgressView().controlSize(.small)
+            if let url = viewModel.selectedURL {
+                Text("·")
+                    .foregroundStyle(DT.fgSubtle)
+                Text(url.path)
+                    .font(DT.mono(11))
+                    .foregroundStyle(DT.fgMuted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
             Spacer()
 
-            if let url = viewModel.selectedURL {
-                Text(url.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            if viewModel.isScanning {
+                Button("Cancel") { viewModel.cancel() }
+                    .buttonStyle(QuietButtonStyle(variant: .secondary))
+            } else {
+                if viewModel.selectedURL != nil {
+                    Button("Rescan") {
+                        if let url = viewModel.selectedURL { viewModel.scan(url: url) }
+                    }
+                    .buttonStyle(QuietButtonStyle(variant: .ghost))
+                    .keyboardShortcut("r", modifiers: .command)
+                }
+                Button("Choose Folder") { viewModel.pickAndScan() }
+                    .buttonStyle(QuietButtonStyle(variant: .secondary))
+                    .keyboardShortcut("o", modifiers: .command)
+                Button("Scan Home") { viewModel.scanHome() }
+                    .buttonStyle(QuietButtonStyle(variant: .primary))
+                    .keyboardShortcut("h", modifiers: .command)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(DT.bg)
     }
 
-    @ViewBuilder
-    private var content: some View {
-        if let root = viewModel.root {
-            treeView(root: root)
-        } else if viewModel.isScanning {
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Scanning…").font(.headline)
+    // MARK: List
+
+    private func listBody(root: FileNode) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                if let children = root.children {
+                    ForEach(Array(children.enumerated()), id: \.element.id) { idx, child in
+                        FileNodeRow(
+                            node: child,
+                            parentSize: root.size,
+                            rank: idx,
+                            depth: 0
+                        )
+                    }
+                }
+            }
+            .padding(.horizontal, DT.gutter - 8)
+            .padding(.vertical, 10)
+        }
+        .background(DT.bg)
+    }
+
+    // MARK: Scanning state
+
+    private var scanningState: some View {
+        VStack(alignment: .center, spacing: 18) {
+            Spacer()
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                let parts = SizeFormatter.split(viewModel.progress.bytesScanned)
+                Text(parts.number)
+                    .font(DT.text(44, weight: .light))
+                    .foregroundStyle(DT.fg)
+                    .monospacedDigit()
+                Text(parts.unit.isEmpty ? "bytes" : parts.unit)
+                    .font(DT.text(16))
+                    .foregroundStyle(DT.fgMuted)
+            }
+            .contentTransition(.numericText())
+            .animation(.easeOut(duration: 0.25), value: viewModel.progress.bytesScanned)
+
+            VStack(spacing: 3) {
+                Text("\(viewModel.progress.filesScanned.formatted()) items · \(String(format: "%.1fs", viewModel.elapsed))")
+                    .font(DT.mono(11))
+                    .foregroundStyle(DT.fgMuted)
                 Text(viewModel.progress.currentPath)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(DT.mono(10))
+                    .foregroundStyle(DT.fgSubtle)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: 600)
+                    .frame(maxWidth: 520)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            emptyState
-        }
-    }
-
-    private func treeView(root: FileNode) -> some View {
-        List {
-            FileNodeRow(node: root, parentSize: root.size, rootSize: root.size, isRoot: true)
-        }
-        .listStyle(.inset)
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "externaldrive.badge.questionmark")
-                .font(.system(size: 48))
-                .foregroundStyle(.tertiary)
-            Text("Disk Analyzer")
-                .font(.title2).bold()
-            Text("Choose a folder or volume to see what's using your space.")
-                .foregroundStyle(.secondary)
-            HStack {
-                Button("Scan Home Folder") { viewModel.scanHome() }
-                    .buttonStyle(.borderedProminent)
-                Button("Choose Folder…") { viewModel.pickAndScan() }
-            }
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(DT.bg)
     }
 
+    // MARK: Empty state
+
+    private var emptyState: some View {
+        VStack(alignment: .center, spacing: 0) {
+            Spacer()
+
+            VStack(spacing: 10) {
+                Text("See what's using your disk")
+                    .font(DT.text(22, weight: .semibold))
+                    .foregroundStyle(DT.fg)
+                Text("Pick a folder. Cross-volume mounts — NAS, externals — are skipped automatically.")
+                    .font(DT.text(13))
+                    .foregroundStyle(DT.fgMuted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
+            }
+            .padding(.bottom, 24)
+
+            HStack(spacing: 10) {
+                Button("Scan Home") { viewModel.scanHome() }
+                    .buttonStyle(QuietButtonStyle(variant: .primary))
+                Button("Choose Folder") { viewModel.pickAndScan() }
+                    .buttonStyle(QuietButtonStyle(variant: .secondary))
+            }
+
+            Spacer()
+
+            VStack(spacing: 14) {
+                Text("Quick scan")
+                    .font(DT.text(11, weight: .medium))
+                    .foregroundStyle(DT.fgMuted)
+                HStack(spacing: 6) {
+                    QuickChip(label: "DerivedData") {
+                        viewModel.scan(url: URL(fileURLWithPath: ("~/Library/Developer/Xcode/DerivedData" as NSString).expandingTildeInPath))
+                    }
+                    QuickChip(label: "Simulators") {
+                        viewModel.scan(url: URL(fileURLWithPath: ("~/Library/Developer/CoreSimulator" as NSString).expandingTildeInPath))
+                    }
+                    QuickChip(label: "Caches") {
+                        viewModel.scan(url: URL(fileURLWithPath: ("~/Library/Caches" as NSString).expandingTildeInPath))
+                    }
+                    QuickChip(label: "Containers") {
+                        viewModel.scan(url: URL(fileURLWithPath: ("~/Library/Containers" as NSString).expandingTildeInPath))
+                    }
+                    QuickChip(label: "Downloads") {
+                        viewModel.scan(url: URL(fileURLWithPath: ("~/Downloads" as NSString).expandingTildeInPath))
+                    }
+                }
+            }
+            .padding(.bottom, 40)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(DT.bg)
+    }
+
+    // MARK: Status bar
+
     private var statusBar: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
             if viewModel.isScanning || viewModel.elapsed > 0 {
-                Text("Files: \(viewModel.progress.filesScanned)")
-                Text("Size: \(SizeFormatter.string(viewModel.progress.bytesScanned))")
-                Text(String(format: "%.1fs", viewModel.elapsed))
-                    .foregroundStyle(.secondary)
+                statusPair(label: "Files", value: viewModel.progress.filesScanned.formatted())
+                statusPair(label: "Size", value: SizeFormatter.string(viewModel.progress.bytesScanned))
+                statusPair(label: "Time", value: String(format: "%.1fs", viewModel.elapsed))
                 if viewModel.progress.skippedMounts > 0 {
-                    Text("Skipped \(viewModel.progress.skippedMounts) off-volume entries")
-                        .foregroundStyle(.orange)
-                        .help("External drives, NAS mounts, and other volumes are excluded so sizes reflect only the boot disk.")
+                    statusPair(
+                        label: "Skipped",
+                        value: "\(viewModel.progress.skippedMounts) off-volume",
+                        valueColor: DT.accent
+                    )
                 }
             }
             Spacer()
             if let root = viewModel.root {
-                Text("Total: \(SizeFormatter.string(root.size))")
-                    .font(.system(.caption, design: .monospaced))
-                    .bold()
+                statusPair(label: "Total", value: SizeFormatter.string(root.size), valueColor: DT.fg)
             }
         }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, DT.gutter)
+        .padding(.vertical, 8)
+        .background(DT.bg)
+        .overlay(Rectangle().fill(DT.line).frame(height: 1), alignment: .top)
+    }
+
+    private func statusPair(label: String, value: String, valueColor: Color = DT.fgMuted) -> some View {
+        HStack(spacing: 5) {
+            Text(label)
+                .font(DT.text(10))
+                .foregroundStyle(DT.fgSubtle)
+            Text(value)
+                .font(DT.mono(11))
+                .foregroundStyle(valueColor)
+                .monospacedDigit()
+        }
     }
 }
 
-/// Recursive row with its own expansion state. Lazy: children aren't rendered
-/// until the user expands the row, so huge trees stay responsive.
+// MARK: - Support views
+
+private struct QuickChip: View {
+    let label: String
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(DT.text(11, weight: .medium))
+                .foregroundStyle(hover ? DT.accent : DT.fg)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6)
+                .background(hover ? DT.accentSoft : DT.surface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 999, style: .continuous)
+                        .stroke(hover ? DT.accent.opacity(0.3) : DT.lineStrong, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 999, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+    }
+}
+
+// MARK: - Recursive outline
+
+/// Hand-rolled disclosure so the chevron matches the quiet palette.
 struct FileNodeRow: View {
     let node: FileNode
     let parentSize: Int64
-    let rootSize: Int64
-    var isRoot: Bool = false
+    let rank: Int
+    let depth: Int
 
-    @State private var isExpanded: Bool
+    @State private var isExpanded = false
 
-    init(node: FileNode, parentSize: Int64, rootSize: Int64, isRoot: Bool = false) {
-        self.node = node
-        self.parentSize = parentSize
-        self.rootSize = rootSize
-        self.isRoot = isRoot
-        _isExpanded = State(initialValue: isRoot)
-    }
+    private var hasChildren: Bool { node.children?.isEmpty == false }
 
     var body: some View {
-        if let children = node.children, !children.isEmpty {
-            DisclosureGroup(isExpanded: $isExpanded) {
-                ForEach(children) { child in
-                    FileNodeRow(node: child, parentSize: node.size, rootSize: rootSize)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                if hasChildren {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.16)) { isExpanded.toggle() }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DT.fgMuted)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .frame(width: 14, height: 14)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Color.clear.frame(width: 14, height: 14)
                 }
-            } label: {
-                FileRowView(node: node, parentSize: parentSize, rootSize: rootSize)
+
+                FileRowView(node: node, parentSize: parentSize, rank: rank)
             }
-        } else {
-            FileRowView(node: node, parentSize: parentSize, rootSize: rootSize)
+            .padding(.leading, CGFloat(depth) * 18)
+
+            if isExpanded, let children = node.children {
+                ForEach(Array(children.enumerated()), id: \.element.id) { idx, child in
+                    FileNodeRow(
+                        node: child,
+                        parentSize: node.size,
+                        rank: idx,
+                        depth: depth + 1
+                    )
+                }
+            }
         }
     }
 }
