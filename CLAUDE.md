@@ -62,6 +62,13 @@ DiskAnalyzer/
 └── README.md                           # User-facing
 ```
 
+## Git workflow
+
+- **`main` 是受保护分支：禁止直接 push。** GitHub branch protection（PR 唯一入口）+ 本地 `pre-push` hook 双重拦截。
+- 开发流程：`git checkout -b feature/…` → commit → push → `gh pr create` → squash merge 到 main。
+- 新 clone 后先运行 `sh scripts/install-git-hooks.sh` 安装本地 hook。
+- 不要对 `main` 使用 `--force` / force-push。
+
 ## Build / run
 
 ```bash

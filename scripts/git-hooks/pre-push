@@ -1,0 +1,17 @@
+#!/bin/sh
+# 禁止直接 push 到受保护分支（main / master）。
+# 所有改动必须通过 feature branch + Pull Request 合并。
+set -u
+
+PROTECTED="main master"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  for branch in $PROTECTED; do
+    if [ "$remote_ref" = "refs/heads/$branch" ]; then
+      echo "✋ 禁止直接 push 到 $branch —— 请创建 feature branch 并走 PR 合并（squash）"
+      exit 1
+    fi
+  done
+done
+
+exit 0
