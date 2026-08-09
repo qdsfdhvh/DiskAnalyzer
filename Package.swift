@@ -11,6 +11,11 @@ let package = Package(
         .executableTarget(
             name: "DiskAnalyzer",
             path: "Sources/DiskAnalyzer"
+        ),
+        .testTarget(
+            name: "DiskAnalyzerTests",
+            dependencies: ["DiskAnalyzer"],
+            path: "Tests/DiskAnalyzerTests"
         )
     ]
 )

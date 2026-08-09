@@ -93,6 +93,16 @@ Pill-shaped (`cornerRadius: 999`), white fill, `DT.lineStrong` border, hover fli
 
 A single row at the bottom, `DT.bg` background, top border `DT.line`. Each field is a label/value pair: tiny 10pt subtle label + 11pt mono value. The `Skipped` field uses `DT.accent` as its value color — this is the one exception to "accent = row anchor", and it earns it because "we excluded N things from your number" is a trust-affecting claim that should catch the eye.
 
+### Analysis flow (cleanup recommendations)
+
+The cleanup feature follows the same language; the only new accents are warning-colored (never decorative):
+
+- **Recommendations | Files segmented control** — two flat 6pt-radius segments in the toolbar row; selected segment gets `DT.surface` fill + `DT.lineStrong` border, unselected is text-only. Sentence case, no uppercase tracking.
+- **Candidate rows** — same 13pt name + mono size layout as file rows, but the bar is replaced by a short 11pt muted reason line under the name. Risk label sits right of the name: `Low risk` in `DT.fgSubtle`, `Review` in `DT.fgMuted`, `High risk` in `DT.accent`. A small chevron discloses the evidence list.
+- **High-risk approval** — high-risk rows show a small terracotta capsule "Approve" instead of a checkbox. First interaction approves (and the checkbox appears); a second interaction selects. Two steps, never one.
+- **Plan summary** — one line: item count + total reclaimable in muted mono, then `Selected:` in medium mono. The primary action ("Clean Selected…") is the only `.primary` button on the screen.
+- **Confirmation sheet** — exact items + total, secondary Cancel + primary "Move to Trash". The result view uses "moved to Trash", never "deleted"; skipped/failed items are listed individually with typed reasons.
+
 ---
 
 ## Anti-patterns

@@ -1,5 +1,54 @@
+# ── macOS ────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+*.swp
+*.swo
+
+# ── Swift / Xcode ────────────────────────────────────────
 .build/
 .swiftpm/
 Package.resolved
-DiskAnalyzer.app/
 *.xcodeproj/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.localized/
+
+# ── App bundle output (produced by `make app`) ──────────
+DiskAnalyzer.app/
+
+# ── IDE / editors ────────────────────────────────────────
+.idea/
+*.iml
+*.code-workspace
+
+# ── Environment / secrets ────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+*.log.*
+
+# ── pi session / planning scratch (never committed) ─────
+.pi/
+.pi-subagents/
+task_plan.md
+findings.md
+progress.md

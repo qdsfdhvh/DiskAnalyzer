@@ -6,35 +6,78 @@ SwiftUI macOS utility for visualizing disk usage. Built as a Swift Package (no `
 
 ```
 DiskAnalyzer/
-├── Package.swift                       # macOS 13+, single executable target
+├── Package.swift                       # macOS 13+, executable target + test target
+├── Makefile                            # make app / run / install / clean
 ├── Sources/DiskAnalyzer/
 │   ├── DiskAnalyzerApp.swift           # @main — WindowGroup only
-│   ├── ContentView.swift               # ScanViewModel + top-level UI
+│   ├── ContentView.swift               # NavigationSplitView: sidebar + detail
+│   ├── AppViewModel.swift              # Manages multiple scan sessions
 │   ├── Models/
 │   │   ├── FileNode.swift              # Tree node (class; identity-based)
-│   │   ├── DiskScanner.swift           # Concurrent scan + Counter actor-ish class
-│   │   └── BulkScan.swift              # getattrlistbulk(2) wrapper (no Foundation)
+│   │   ├── DiskScanner.swift           # Concurrent scan + Counter actor + ScanLimiter
+│   │   ├── BulkScan.swift              # getattrlistbulk(2) wrapper (no Foundation)
+│   │   └── ScanSessionController.swift # One scan session: state + lifecycle
+│   ├── Analysis/
+│   │   ├── Models/                     # AnalysisPreferences/Report/Warning, CleanupCandidate…
+│   │   ├── CandidateSeedDiscovery.swift# Single-pass seed discovery (no FS calls)
+│   │   ├── CandidateEnricher.swift     # Bounded lstat enrichment + risk/evidence
+│   │   ├── FileFingerprinting.swift    # lstat fingerprint seam (deviceID/inode/size/mtime)
+│   │   ├── AnalysisEngine.swift        # Analyzing seam: discovery + enrichment
+│   │   └── AnalysisFlowViewModel.swift # Flow state machine (review/clean lifecycle)
+│   ├── Planning/
+│   │   ├── Models/PlanningModels.swift # Draft/plan models (candidate IDs only in drafts)
+│   │   ├── CleanupPlanner.swift        # CleanupPlanning seam
+│   │   ├── LocalCleanupPlanner.swift   # Deterministic offline planning
+│   │   ├── CleanupPlanValidator.swift  # SOLE draft→plan authority; copies facts from report
+│   │   ├── PlanningCoordinator.swift   # Remote/local selection + fallback
+│   │   └── AI/
+│   │       ├── PrivacyRedactor.swift   # Path redaction → <private-N> labels
+│   │       ├── RemotePlanningDTO.swift # Bounded upload payload (no URL/fingerprint)
+│   │       ├── OpenAICompatibleClient.swift # BYOK chat-completions client
+│   │       ├── RemoteCleanupPlanner.swift   # AI CleanupPlanning adapter
+│   │       └── APIKeyStore.swift       # Keychain storage seam
+│   ├── Cleanup/
+│   │   ├── CleanupModels.swift         # ApprovedCleanupItem, PreflightRejection
+│   │   ├── PreflightValidator.swift    # Root containment + fingerprint re-check
+│   │   ├── CleanupExecutor.swift       # CleanupExecuting seam + outcomes
+│   │   └── TrashCleanupExecutor.swift  # Trash mover + preflight + cancel
 │   └── Views/
-│       ├── FileRowView.swift           # One row: icon, bar, %, size, context menu
-│       └── SizeFormatter.swift         # ByteCountFormatter + percent helper
-├── build-app.sh                        # Wraps release binary into DiskAnalyzer.app
+│       ├── DesignTokens.swift          # DT color/typography/metrics
+│       ├── SizeFormatter.swift         # ByteCountFormatter + percent helpers
+│       ├── HeroPanelView.swift         # Summary header (size + volume)
+│       ├── FileRowView.swift           # One file row with bar/%/context menu
+│       ├── SidebarView.swift           # Left panel: session list + add menu
+│       ├── ScanDetailView.swift        # Right panel: Recommendations | Files toggle
+│       ├── AppsView.swift              # Installed applications by size
+│       └── Analysis/
+│           ├── AnalysisStartView.swift # Goal + folder picker start screen
+│           ├── AnalysisProgressView.swift
+│           ├── CleanupPlanView.swift   # Plan groups + selection + Clean button
+│           ├── CleanupCandidateRow.swift
+│           ├── CleanupConfirmationView.swift
+│           └── CleanupResultView.swift
+├── Tests/DiskAnalyzerTests/            # ~140 tests; testable via `swift test`
+├── docs/ai-cleanup/                    # ARCHITECTURE, IMPLEMENTATION_BACKLOG, AGENT_PLAYBOOK, PRIVACY
+├── DESIGN.md                           # Architecture notes
 └── README.md                           # User-facing
 ```
 
 ## Build / run
 
 ```bash
-swift run -c release          # opens a SwiftUI window
-swift build                   # debug build only
-./build-app.sh                # produces DiskAnalyzer.app (ad-hoc signed)
-open DiskAnalyzer.app
+make app                # produces DiskAnalyzer.app (ad-hoc signed)
+make run                # build + launch immediately
+make install            # copy to /Applications
+make clean              # remove .app + .build
+swift run -c release    # debug launch (no Dock icon)
+swift build             # debug build only
 ```
 
 There is no Xcode project. If you want one, run `swift package generate-xcodeproj` or open `Package.swift` in Xcode directly — both work.
 
 ## Design decisions worth preserving
 
-- **Swift Package, not `.xcodeproj`.** Chosen so the repo is diffable and re-openable without Xcode state. The `.app` is produced by `build-app.sh`, which is the only supported distribution path.
+- **Swift Package, not `.xcodeproj`.** Chosen so the repo is diffable and re-openable without Xcode state. The `.app` is produced by `make app`, which is the only supported distribution path.
 - **`getattrlistbulk(2)` for the hot loop, not `FileManager`.** One kernel call pulls 50–500 entries with their name/type/fsid/allocated-size in a packed buffer — replaces a `contentsOfDirectory` + N × `resourceValues` roundtrip that each go through CFURL / path resolution / a Foundation cache. Parsing is hand-rolled against the `<sys/attr.h>` bit-order + RETURNED_ATTRS rules; see `BulkScan.swift` for the reference. Keep reads under a 64 KiB stack buffer (`withUnsafeTemporaryAllocation`) — no heap per directory.
 - **`ATTR_FILE_ALLOCSIZE`, not `fileSize`.** Same semantics as `URLResourceKey.totalFileAllocatedSizeKey`: block-aligned allocation across all forks. Matches Finder's "Size on disk". The old fallback to `fileSize` is gone because bulk always returns allocsize for regular files.
 - **Symlinks skipped.** Prevents cycles and double-counting — this is intentional. Do not "fix" by following them without also deduplicating by inode.
@@ -45,6 +88,12 @@ There is no Xcode project. If you want one, run `swift package generate-xcodepro
 - **Counter is `NSLock`-protected, not an actor.** Actors would force `await` on every file, which dominates when scanning 500K+ files. The class is `@unchecked Sendable` with a lock — measured ~3× faster than an actor on a ~200GB home scan.
 - **Progress is polled, not pushed.** A background `Task.detached` snapshots the counter every 100ms; individual file scans don't touch `@MainActor`. Switching to per-file main-actor hops stalled the UI on SSD scans.
 - **No sandboxing, no entitlements.** A sandboxed build can't traverse `~/Library` without prompting per-folder. The app is meant for local use — keep it unsandboxed.
+- **Analysis is two-phase.** Discovery reads only the in-memory scan tree (path/size/type/position — zero filesystem calls, capped at 200 seeds); enrichment is the only stage allowed to `lstat`, exactly once per seed. Never put `stat`/`resourceValues` back into the scanner hot loop.
+- **The validator is the sole draft→plan authority.** `CleanupPlanValidator` copies path/size/risk/action/evidence verbatim from the local report by candidate ID; a planner (local or AI) can only supply ordering, grouping, and bounded explanation text. Drafts cannot carry executable fields.
+- **AI never touches files.** `RemoteCleanupPlanner` sends only the redacted DTO (max 100 candidates, `<private-N>` path labels, no URL/fingerprint/timestamps); the coordinator falls back to the local plan on any remote failure. Keys live in the Keychain.
+- **All filesystem mutation goes through the executor seam.** Views and view models call `CleanupExecuting`/`AppViewModel.moveToTrash`; no View file calls `FileManager` directly (a grep guards this). Preflight re-verifies root containment, symlink policy, and fingerprint before every move.
+- **V1 moves to Trash only.** No permanent deletion, no shell, no admin elevation. Every outcome (moved/skipped/failed) is reported per item.
+- **Tests cover the seams, not the scanner internals.** ~140 tests exercise discovery, enrichment, planning, validation, preflight, the executor (with a fake trash mover), the flow view model, redaction, and the AI client (with a fake transport).
 
 ## Non-goals
 

@@ -8,6 +8,8 @@ struct FileRowView: View {
     let node: FileNode
     let parentSize: Int64
     let rank: Int   // 0 = largest in parent
+    var isScanning: Bool = false  // true for directories still being scanned
+    var onMoveToTrash: ((URL) -> Void)? = nil
 
     @State private var isHovering = false
 
@@ -32,28 +34,38 @@ struct FileRowView: View {
                 .truncationMode(.middle)
                 .frame(maxWidth: 280, alignment: .leading)
 
-            // Proportional bar. 3pt tall, rounded, tinted by tier.
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(DT.line)
-                    Capsule()
-                        .fill(tierColor)
-                        .frame(width: max(2, geo.size.width * fraction))
+            if isScanning && node.isDirectory {
+                // Directory still being scanned — placeholder instead of
+                // bar / percentage / size.
+                Spacer()
+                Text("Scanning…")
+                    .font(DT.mono(11))
+                    .foregroundStyle(DT.fgSubtle)
+                    .frame(width: 144, alignment: .trailing)
+            } else {
+                // Proportional bar. 3pt tall, rounded, tinted by tier.
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(DT.line)
+                        Capsule()
+                            .fill(tierColor)
+                            .frame(width: max(2, geo.size.width * fraction))
+                    }
                 }
+                .frame(height: 3)
+
+                Text(percentLabel)
+                    .font(DT.mono(11))
+                    .foregroundStyle(DT.fgMuted)
+                    .monospacedDigit()
+                    .frame(width: 48, alignment: .trailing)
+
+                Text(SizeFormatter.string(node.size))
+                    .font(DT.mono(12, weight: rank == 0 ? .semibold : .regular))
+                    .foregroundStyle(DT.fg)
+                    .monospacedDigit()
+                    .frame(width: 92, alignment: .trailing)
             }
-            .frame(height: 3)
-
-            Text(percentLabel)
-                .font(DT.mono(11))
-                .foregroundStyle(DT.fgMuted)
-                .monospacedDigit()
-                .frame(width: 48, alignment: .trailing)
-
-            Text(SizeFormatter.string(node.size))
-                .font(DT.mono(12, weight: rank == 0 ? .semibold : .regular))
-                .foregroundStyle(DT.fg)
-                .monospacedDigit()
-                .frame(width: 92, alignment: .trailing)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, DT.rowVPadding)
@@ -72,7 +84,7 @@ struct FileRowView: View {
             }
             Divider()
             Button("Move to Trash", role: .destructive) {
-                try? FileManager.default.trashItem(at: node.url, resultingItemURL: nil)
+                onMoveToTrash?(node.url)
             }
         }
     }

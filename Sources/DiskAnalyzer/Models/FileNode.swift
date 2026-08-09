@@ -1,12 +1,12 @@
 import Foundation
 
-final class FileNode: Identifiable, Hashable {
+final class FileNode: Identifiable, Hashable, @unchecked Sendable {
     let id: UInt64
     let url: URL
     let name: String
     let isDirectory: Bool
     var size: Int64
-    var children: [FileNode]?
+    var children: [FileNode] = []
     weak var parent: FileNode?
 
     // Monotonic counter shared across all scans in the process. Avoids the
@@ -22,7 +22,7 @@ final class FileNode: Identifiable, Hashable {
         return id
     }
 
-    init(url: URL, name: String, isDirectory: Bool, size: Int64 = 0, children: [FileNode]? = nil) {
+    init(url: URL, name: String, isDirectory: Bool, size: Int64 = 0, children: [FileNode] = []) {
         self.id = Self.allocID()
         self.url = url
         self.name = name
